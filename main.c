@@ -5,15 +5,45 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sqlite3.h>
+#define _GNU_SOURCE
 
 #define PORT 2525
 #define BUFFER_SIZE 1024
 
+typedef struct {
+  char* from;
+  char* to;
+  char* body;
+} email;
+
+// Caller is responsible for freeing memory here
+char* email_str(email* email_ptr) {
+  char* buff;
+  int size = asprintf(&buff, "From: %s\nTo:%s\nBody:\n%s\n", email_ptr->from, email_ptr->to, email_ptr->body);
+  if (size == -1) {
+    printf("asprintf alloc failed\n");
+    exit(EXIT_FAILURE);
+  }
+  return buff;
+}
+
+int server_socket;
+
+void signal_handler(int sig) {
+  printf("\nReceived signal %d. Closing the socket.\n", sig);
+  close(server_socket);
+  exit(EXIT_SUCCESS);
+}
+
 void handle_ehlo(int client_socket) {
   char response[BUFFER_SIZE];
+  /* snprintf(response, BUFFER_SIZE, */
+  /*          "250-smtp.example.com\r\n250-PIPELINING\r\n250-SIZE " */
+  /*          "10240000\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n"); */
   snprintf(response, BUFFER_SIZE,
-           "250-smtp.example.com\r\n250-PIPELINING\r\n250-SIZE "
-           "10240000\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n");
+           "250 smtp.example.com\r\n");
   send(client_socket, response, strlen(response), 0);
 }
 
@@ -49,7 +79,7 @@ void handle_data(int client_socket) {
     total_bytes_received += bytes_received;
 
     if (total_bytes_received >= 5 &&
-        strcmp(message_content + total_bytes_received - 5, "\r\n.\r\n") == 0) {
+        strncmp(message_content + total_bytes_received - 5, "\r\n.\r\n", 5) == 0) {
       // Message content ends with a single period
       // Handle email here, db, or otherwise
       total_bytes_received -= 5;
@@ -73,11 +103,45 @@ void handle_data(int client_socket) {
 }
 
 int main() {
-  int server_socket;
+  sqlite3 *db;
+  sqlite3_stmt *res;
+
+  int rc = sqlite3_open(":memory:", &db);
+
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
+    sqlite3_close(db);
+
+    return 1;
+  }
+
+  rc = sqlite3_prepare_v2(db, "SELECT SQLITE_VERSION()", -1, &res, 0);
+
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Failed to fetch data: %s\n", sqlite3_errmsg(db));
+    sqlite3_close(db);
+
+    return 1;
+  }
+
+  rc = sqlite3_step(res);
+
+  if (rc == SQLITE_ROW) {
+    printf("%s\n", sqlite3_column_text(res, 0));
+  }
+
+  sqlite3_finalize(res);
+  sqlite3_close(db);
+
   int client_socket;
   struct sockaddr_in server_addr;
   struct sockaddr_in client_addr;
   char buffer[BUFFER_SIZE];
+
+  if (signal(SIGINT, signal_handler) == SIG_ERR) {
+    perror("Unable to set up signal handler");
+    return EXIT_FAILURE;
+}
 
   // Create our socket
   server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -120,7 +184,12 @@ int main() {
 
     printf("Connection accepted. Client socket: %d\n", client_socket);
 
+    // Send client a greeting
+    send(client_socket, "220 Welcome to my custom SMTP server\r\n", 38, 0);
+
     while (1) {
+      email current_email;
+      memset(&current_email, 0, sizeof(email));
       memset(buffer, 0, BUFFER_SIZE);
 
       int bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
@@ -144,14 +213,16 @@ int main() {
       } else if (strncmp(buffer, "MAIL FROM:", 10) == 0) {
         char *from_address = buffer + 10;
         handle_mail_from(client_socket, from_address);
-      } else if (strncmp(buffer, "MAIL TO:", 8) == 0) {
+      } else if (strncmp(buffer, "RCPT TO:", 8) == 0) {
         char *to_address = buffer + 8;
         handle_mail_to(client_socket, to_address);
       } else if (strncmp(buffer, "DATA", 4) == 0) {
+        send(client_socket, "354 End data with <CR><LF>.<CR><LF>\r\n", 37, 0);
         handle_data(client_socket);
       } else if (strncmp(buffer, "QUIT", 4) == 0) {
         send(client_socket, "221 Goodbye\r\n", 14, 0);
         close(client_socket);
+        break;
       }
     }
   }
