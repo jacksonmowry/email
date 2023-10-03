@@ -1,32 +1,39 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <signal.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <signal.h>
-#include <sqlite3.h>
 #define _GNU_SOURCE
 
 #define PORT 2525
 #define BUFFER_SIZE 1024
 
 typedef struct {
-  char* from;
-  char* to;
-  char* body;
+  char *from;
+  char *to;
+  char *body;
 } email;
 
 // Caller is responsible for freeing memory here
-char* email_str(email* email_ptr) {
-  char* buff;
-  int size = asprintf(&buff, "From: %s\nTo:%s\nBody:\n%s\n", email_ptr->from, email_ptr->to, email_ptr->body);
-  if (size == -1) {
-    printf("asprintf alloc failed\n");
-    exit(EXIT_FAILURE);
-  }
+char *email_str(email *email_ptr) {
+  /* printf("from size: %d\n", strlen(email_ptr->from)); */
+  /* printf("to size: %d\n", strlen(email_ptr->to)); */
+  /* printf("body size: %d\n", strlen(email_ptr->body)); */
+  char *buff = (char *)malloc(strlen(email_ptr->from) + strlen(email_ptr->to) + strlen(email_ptr->body) + 19);
+  sprintf(buff, "From: %s\nTo:%s\nBody:\n%s\n", email_ptr->from,
+                      email_ptr->to, email_ptr->body);
   return buff;
+}
+
+int email_free(email *email_ptr) {
+  free(email_ptr->from);
+  free(email_ptr->to);
+  free(email_ptr->body);
+  return 0;
 }
 
 int server_socket;
@@ -39,29 +46,34 @@ void signal_handler(int sig) {
 
 void handle_ehlo(int client_socket) {
   char response[BUFFER_SIZE];
-  /* snprintf(response, BUFFER_SIZE, */
-  /*          "250-smtp.example.com\r\n250-PIPELINING\r\n250-SIZE " */
-  /*          "10240000\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n"); */
-  snprintf(response, BUFFER_SIZE,
-           "250 smtp.example.com\r\n");
+  snprintf(response, BUFFER_SIZE, "250 smtp.example.com\r\n");
   send(client_socket, response, strlen(response), 0);
 }
 
-void handle_mail_from(int client_socket, char *from_address) {
+void handle_mail_from(int client_socket, char *from_address, email *email_ptr) {
   // Validate email
-
+  email_ptr->from = (char *)malloc(strlen(from_address) - 1);
+  if (email_ptr->from == NULL) {
+    fprintf(stderr, "Memory allocation failed\n");
+    close(client_socket);
+    return;
+  }
+  strncpy(email_ptr->from, from_address, strlen(from_address) - 2);
+  email_ptr->from[strlen(from_address)-2] = '\0';
   // Respond with 250 OK
   send(client_socket, "250 OK\r\n", 8, 0);
 }
 
-void handle_mail_to(int client_socket, char *to_address) {
+void handle_mail_to(int client_socket, char *to_address, email *email_ptr) {
   // Validate email, and make sure we have this user
-
+  email_ptr->to = (char *)malloc(strlen(to_address) - 1);
+  strncpy(email_ptr->to, to_address, strlen(to_address) - 2);
+  email_ptr->to[strlen(to_address)-2] = '\0';
   // Respond with 250 OK
   send(client_socket, "250 OK\r\n", 8, 0);
 }
 
-void handle_data(int client_socket) {
+void handle_data(int client_socket, email* email_ptr) {
   char message_content[BUFFER_SIZE];
   int total_bytes_received = 0;
 
@@ -79,12 +91,14 @@ void handle_data(int client_socket) {
     total_bytes_received += bytes_received;
 
     if (total_bytes_received >= 5 &&
-        strncmp(message_content + total_bytes_received - 5, "\r\n.\r\n", 5) == 0) {
+        strncmp(message_content + total_bytes_received - 5, "\r\n.\r\n", 5) ==
+            0) {
       // Message content ends with a single period
       // Handle email here, db, or otherwise
       total_bytes_received -= 5;
-      printf("Received message content:\n%.*s\n", total_bytes_received,
-             message_content);
+      email_ptr->body = (char *)malloc(total_bytes_received + 1);
+      strncpy(email_ptr->body, message_content, total_bytes_received);
+      email_ptr->body[total_bytes_received] = '\0';
       // Respond with 250 OK
       send(client_socket, "250 OK\r\n", 8, 0);
       break;
@@ -141,7 +155,7 @@ int main() {
   if (signal(SIGINT, signal_handler) == SIG_ERR) {
     perror("Unable to set up signal handler");
     return EXIT_FAILURE;
-}
+  }
 
   // Create our socket
   server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -186,10 +200,10 @@ int main() {
 
     // Send client a greeting
     send(client_socket, "220 Welcome to my custom SMTP server\r\n", 38, 0);
+    email current_email;
+    memset(&current_email, 0, sizeof(email));
 
     while (1) {
-      email current_email;
-      memset(&current_email, 0, sizeof(email));
       memset(buffer, 0, BUFFER_SIZE);
 
       int bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
@@ -212,15 +226,21 @@ int main() {
         handle_ehlo(client_socket);
       } else if (strncmp(buffer, "MAIL FROM:", 10) == 0) {
         char *from_address = buffer + 10;
-        handle_mail_from(client_socket, from_address);
+        handle_mail_from(client_socket, from_address, &current_email);
       } else if (strncmp(buffer, "RCPT TO:", 8) == 0) {
         char *to_address = buffer + 8;
-        handle_mail_to(client_socket, to_address);
+        handle_mail_to(client_socket, to_address, &current_email);
       } else if (strncmp(buffer, "DATA", 4) == 0) {
         send(client_socket, "354 End data with <CR><LF>.<CR><LF>\r\n", 37, 0);
-        handle_data(client_socket);
+        handle_data(client_socket, &current_email);
       } else if (strncmp(buffer, "QUIT", 4) == 0) {
         send(client_socket, "221 Goodbye\r\n", 14, 0);
+        char *email_string = email_str(&current_email);
+        printf("%s\n", email_string);
+        free(email_string);
+        if (email_free(&current_email)) {
+          fprintf(stderr, "Failed to free email struct\n");
+        }
         close(client_socket);
         break;
       }
