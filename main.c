@@ -20,11 +20,11 @@ typedef struct {
 
 // Caller is responsible for freeing memory here
 char *email_str(email *email_ptr) {
-  /* printf("from size: %d\n", strlen(email_ptr->from)); */
-  /* printf("to size: %d\n", strlen(email_ptr->to)); */
-  /* printf("body size: %d\n", strlen(email_ptr->body)); */
-  char *buff = (char *)malloc(strlen(email_ptr->from) + strlen(email_ptr->to) + strlen(email_ptr->body) + 19);
-  sprintf(buff, "From: %s\nTo:%s\nBody:\n%s\n", email_ptr->from,
+  /* char *buff = (char *)malloc(strlen(email_ptr->from) + strlen(email_ptr->to) + strlen(email_ptr->body) + 19); */
+  char *buff;
+  /* sprintf(buff, "From: %s\nTo:%s\nBody:\n%s\n", email_ptr->from, */
+  /*                     email_ptr->to, email_ptr->body); */
+  asprintf(&buff, "From: %s\nTo:%s\nBody:\n%s\n", email_ptr->from,
                       email_ptr->to, email_ptr->body);
   return buff;
 }
