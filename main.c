@@ -20,20 +20,16 @@ typedef struct {
 
 // Caller is responsible for freeing memory here
 char *email_str(email *email_ptr) {
-  /* char *buff = (char *)malloc(strlen(email_ptr->from) + strlen(email_ptr->to) + strlen(email_ptr->body) + 19); */
   char *buff;
-  /* sprintf(buff, "From: %s\nTo:%s\nBody:\n%s\n", email_ptr->from, */
-  /*                     email_ptr->to, email_ptr->body); */
   asprintf(&buff, "From: %s\nTo:%s\nBody:\n%s\n", email_ptr->from,
-                      email_ptr->to, email_ptr->body);
+           email_ptr->to, email_ptr->body);
   return buff;
 }
 
-int email_free(email *email_ptr) {
+void email_free(email *email_ptr) {
   free(email_ptr->from);
   free(email_ptr->to);
   free(email_ptr->body);
-  return 0;
 }
 
 int server_socket;
@@ -50,7 +46,8 @@ void handle_ehlo(int client_socket) {
   send(client_socket, response, strlen(response), 0);
 }
 
-void handle_mail_from(int client_socket, char *from_address, email *email_ptr) {
+void handle_mail_from(int client_socket, const char *from_address,
+                      email *email_ptr) {
   // Validate email
   email_ptr->from = (char *)malloc(strlen(from_address) - 1);
   if (email_ptr->from == NULL) {
@@ -59,21 +56,47 @@ void handle_mail_from(int client_socket, char *from_address, email *email_ptr) {
     return;
   }
   strncpy(email_ptr->from, from_address, strlen(from_address) - 2);
-  email_ptr->from[strlen(from_address)-2] = '\0';
+  email_ptr->from[strlen(from_address) - 2] = '\0';
   // Respond with 250 OK
   send(client_socket, "250 OK\r\n", 8, 0);
 }
 
-void handle_mail_to(int client_socket, char *to_address, email *email_ptr) {
-  // Validate email, and make sure we have this user
+void handle_mail_to(int client_socket, const char *to_address, email *email_ptr,
+                    sqlite3 *db) {
   email_ptr->to = (char *)malloc(strlen(to_address) - 1);
   strncpy(email_ptr->to, to_address, strlen(to_address) - 2);
-  email_ptr->to[strlen(to_address)-2] = '\0';
-  // Respond with 250 OK
-  send(client_socket, "250 OK\r\n", 8, 0);
+  email_ptr->to[strlen(to_address) - 2] = '\0';
+
+  // Validate email, and make sure we have this user
+  sqlite3_stmt *find_user;
+  int code;
+  const char *query = "SELECT 1 FROM users WHERE username = ?";
+  code = sqlite3_prepare_v2(db, query, -1, &find_user, 0);
+  if (code != SQLITE_OK) {
+    fprintf(stderr, "Failed to prepare in 'handle_mail_to': %s\n",
+            sqlite3_errmsg(db));
+    sqlite3_close(db);
+    return;
+  }
+  code = sqlite3_bind_text(find_user, 1, email_ptr->to, -1, 0);
+  if (code != SQLITE_OK) {
+    fprintf(stderr, "Failed to bind in 'handle_mail_to': %s\n",
+            sqlite3_errmsg(db));
+    sqlite3_close(db);
+    return;
+  }
+  code = sqlite3_step(find_user);
+  if (code == SQLITE_ROW) {
+    // Respond with 250 OK
+    send(client_socket, "250 OK\r\n", 8, 0);
+  } else {
+    // User does not exist
+    send(client_socket, "550 5.1.1 User unknown; Invalid recipient address\r\n", 51, 0);
+    close(client_socket);
+  }
 }
 
-void handle_data(int client_socket, email* email_ptr) {
+void handle_data(int client_socket, email *email_ptr) {
   char message_content[BUFFER_SIZE];
   int total_bytes_received = 0;
 
@@ -120,7 +143,7 @@ int main() {
   sqlite3 *db;
   sqlite3_stmt *res;
 
-  int rc = sqlite3_open(":memory:", &db);
+  int rc = sqlite3_open("email.db", &db);
 
   if (rc != SQLITE_OK) {
     fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
@@ -145,7 +168,52 @@ int main() {
   }
 
   sqlite3_finalize(res);
-  sqlite3_close(db);
+
+  // Setting up our tables (Users, Emails)
+  sqlite3_stmt *users_stmt;
+  const char *users = "CREATE TABLE IF NOT EXISTS users(\
+id INTEGER PRIMARY KEY,\
+username TEXT UNIQUE,\
+password TEXT UNIQUE\
+)";
+  int code = sqlite3_prepare_v2(db, users, strlen(users), &users_stmt, 0);
+  if (code != SQLITE_OK) {
+    fprintf(stderr, "Failed to prepare create table 'users': %s\n",
+            sqlite3_errmsg(db));
+    sqlite3_close(db);
+    return 1;
+  }
+  code = sqlite3_step(users_stmt);
+  if (code != SQLITE_DONE) {
+    fprintf(stderr, "Failed to create table 'users': %s\n", sqlite3_errmsg(db));
+    sqlite3_close(db);
+    return 1;
+  }
+  sqlite3_finalize(users_stmt);
+
+  sqlite3_stmt *emails_stmt;
+  const char *emails = "CREATE TABLE IF NOT EXISTS emails(\
+id INTEGER PRIMARY KEY,\
+mail_from TEXT,\
+rcpt_to TEXT,\
+body TEXT,\
+user_id INTEGER\
+)";
+  code = sqlite3_prepare_v2(db, emails, strlen(emails), &emails_stmt, 0);
+  if (code != SQLITE_OK) {
+    fprintf(stderr, "Failed to prepare create table 'emails': %s\n",
+            sqlite3_errmsg(db));
+    sqlite3_close(db);
+    return 1;
+  }
+  code = sqlite3_step(emails_stmt);
+  if (code != SQLITE_DONE) {
+    fprintf(stderr, "Failed to create table 'emails': %s\n",
+            sqlite3_errmsg(db));
+    sqlite3_close(db);
+    return 1;
+  }
+  sqlite3_finalize(emails_stmt);
 
   int client_socket;
   struct sockaddr_in server_addr;
@@ -225,22 +293,55 @@ int main() {
       if (strncmp(buffer, "EHLO", 4) == 0) {
         handle_ehlo(client_socket);
       } else if (strncmp(buffer, "MAIL FROM:", 10) == 0) {
-        char *from_address = buffer + 10;
+        const char *from_address = buffer + 10;
         handle_mail_from(client_socket, from_address, &current_email);
       } else if (strncmp(buffer, "RCPT TO:", 8) == 0) {
-        char *to_address = buffer + 8;
-        handle_mail_to(client_socket, to_address, &current_email);
+        const char *to_address = buffer + 8;
+        // Need to handle the socket and email cleanup here if user DNE
+        handle_mail_to(client_socket, to_address, &current_email, db);
       } else if (strncmp(buffer, "DATA", 4) == 0) {
         send(client_socket, "354 End data with <CR><LF>.<CR><LF>\r\n", 37, 0);
         handle_data(client_socket, &current_email);
       } else if (strncmp(buffer, "QUIT", 4) == 0) {
         send(client_socket, "221 Goodbye\r\n", 14, 0);
+
+        // Debugging line
         char *email_string = email_str(&current_email);
-        printf("%s\n", email_string);
+        printf("----Email Content----\n%s\n", email_string);
         free(email_string);
-        if (email_free(&current_email)) {
-          fprintf(stderr, "Failed to free email struct\n");
+
+        // Insert email into db, TODO check if rcpt exists
+        sqlite3_stmt *email;
+        const char *insert_email = "INSERT INTO emails (mail_from, rcpt_to, "
+                                   "body, user_id) VALUES (?, ?, ?, ?)";
+        int code = sqlite3_prepare_v2(db, insert_email, -1, &email, 0);
+        if (code != SQLITE_OK) {
+          fprintf(stderr,
+                  "Failed to prepare the insert email into 'emails': %s\n",
+                  sqlite3_errmsg(db));
+          sqlite3_close(db);
+          return 1;
         }
+        code = sqlite3_bind_text(email, 1, current_email.from, -1, 0);
+        code = sqlite3_bind_text(email, 2, current_email.to, -1, 0);
+        code = sqlite3_bind_text(email, 3, current_email.body, -1, 0);
+        if (code != SQLITE_OK) {
+          fprintf(stderr, "Failed to bind params for email into 'emails': %s\n",
+                  sqlite3_errmsg(db));
+          sqlite3_close(db);
+          return 1;
+        }
+
+        code = sqlite3_step(email);
+        if (code != SQLITE_DONE) {
+          fprintf(stderr, "Failed to insert email into 'emails': %s\n",
+                  sqlite3_errmsg(db));
+          sqlite3_close(db);
+          return 1;
+        }
+        sqlite3_finalize(email);
+
+        email_free(&current_email);
         close(client_socket);
         break;
       }
@@ -248,6 +349,7 @@ int main() {
   }
 
   close(server_socket);
+  sqlite3_close(db);
 
   return 0;
 }
